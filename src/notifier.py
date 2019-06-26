@@ -1,95 +1,166 @@
-# -*- coding: utf-8 -*-
+import os
+import sys
 
-from __future__ import print_function
+sys.path.append(os.path.join(os.path.abspath(os.path.dirname(__file__)), "vendor"))
 import json
+import logging
+import os
+from datetime import datetime
+from time import sleep
+
 import boto3
-import time
+import requests
 
-# from test_events import TEST_EVENTS, TEST_ERROR_EVENTS
-from build_info import BuildInfo, CodeBuildInfo
-from slack_helper import post_build_msg, find_message_for_build
-from message_builder import MessageBuilder
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
-# import re
-# import sys
+CODEPIPELINE_URL = (
+    "https://{0}.console.aws.amazon.com/codesuite/" "codepipeline/pipelines/{1}/view"
+)
+CODEBUILD_URL = (
+    "https://{0}.console.aws.amazon.com/codesuite/codebuild/"
+    "projects/{1}/build/{1}%3A{2}/log"
+)
+ECS_URL = (
+    "https://{0}.console.aws.amazon.com/ecs/home?region={0}#/"
+    "clusters/{1}/services/{2}/details"
+)
 
-client = boto3.client("codepipeline")
+SLACK_URL = os.environ["SLACK_WEBHOOK_URL"]
 
-
-def find_revision_info(info):
-    r = client.get_pipeline_execution(
-        pipelineName=info.pipeline, pipelineExecutionId=info.executionId
-    )["pipelineExecution"]
-
-    revs = r.get("artifactRevisions", [])
-    if len(revs) > 0:
-        return revs[0]
-    return None
-
-
-def pipeline_from_build(codeBuildInfo):
-    r = client.get_pipeline_state(name=codeBuildInfo.pipeline)
-
-    for s in r["stageStates"]:
-        for a in s["actionStates"]:
-            executionId = a.get("latestExecution", {}).get("externalExecutionId")
-            if executionId and codeBuildInfo.buildId.endswith(executionId):
-                pe = s["latestExecution"]["pipelineExecutionId"]
-                return (s["stageName"], pe, a)
-
-    return (None, None, None)
+# Calors of sack attachment bar
+INFO_POST_COLOR = "#0174DF"
+SUCCESS_POST_COLOR = "#32cd32"
+ERROR_POST_COLOR = "#dc143c"
+ECS_RUN = "#ffa500"
+ECS_STOP = "#808080"
 
 
-def process_code_pipeline(event):
-    buildInfo = BuildInfo.from_event(event)
-    existing_msg = find_message_for_build(buildInfo)
-    builder = MessageBuilder(buildInfo, existing_msg)
-    builder.update_pipeline_event(event)
+def lambda_handler(event, context):
+    logger.info("Event:  " + json.dumps(event))
 
-    if builder.needs_revision_info():
-        revision = find_revision_info(buildInfo)
-        builder.attach_revision_info(revision)
+    region = event["region"]
+    if event["source"] == "aws.codepipeline":
+        parse_pipeline_details(region, event["detail"])
+    elif event["source"] == "aws.codebuild":
+        parse_codebuild_details(region, event["detail"])
+    elif event["source"] == "aws.ecs":
+        parse_ecs_details(region, event["detail"])
 
-    post_build_msg(builder)
+
+def post_to_slack(text, attachments):
+    requests.post(
+        SLACK_URL, data=json.dumps({"text": text, "attachments": attachments})
+    )
 
 
-def process_code_build(event):
-    cbi = CodeBuildInfo.from_event(event)
-    (stage, pid, actionStates) = pipeline_from_build(cbi)
+def parse_pipeline_details(region, detail):
+    pipeline_name = detail["pipeline"]
 
-    if not pid:
+    state = detail["state"]
+
+    codepipeline = boto3.client("codepipeline")
+
+    # Get commit hash and some info of source repository
+    exec_detail = codepipeline.get_pipeline_execution(
+        pipelineName=pipeline_name, pipelineExecutionId=detail["execution-id"]
+    )
+
+    fields = [{"title": "State", "value": state, "short": "true"}]
+
+    pipeline = codepipeline.get_pipeline(name=pipeline_name)
+
+    color = ERROR_POST_COLOR
+    if state == "STARTED":
+        color = INFO_POST_COLOR
+    elif state == "SUCCEEDED":
+        color = SUCCESS_POST_COLOR
+
+    now_unix_time = datetime.now().strftime("%s")
+
+    attachments = [
+        {
+            "fallback": "CodePipeline notification attachment",
+            "color": color,
+            "title": "CodePipeline: " + pipeline_name,
+            "title_link": CODEPIPELINE_URL.format(region, pipeline_name),
+            "fields": fields,
+            "footer": "send by codepipeline-notifier",
+            "ts": now_unix_time,
+        }
+    ]
+
+    post_to_slack("", attachments)
+
+
+def parse_codebuild_details(region, detail):
+    project_name = detail["project-name"]
+    build_id = detail["build-id"].split(":")[-1]
+    state = detail["build-status"]
+
+    fields = [
+        {"title": "Build Status", "value": state, "short": "true"},
+        {"title": "Build ID", "value": build_id, "short": "true"},
+    ]
+
+    # WorkAruond the case this notification is posted before Source stage
+    sleep(3)
+
+    color = ERROR_POST_COLOR
+    if state == "IN_PROGRESS":
+        color = INFO_POST_COLOR
+
+    now_unix_time = datetime.now().strftime("%s")
+
+    attachments = [
+        {
+            "fallback": "AWS CodeBuild notification attachment",
+            "color": color,
+            "title": "AWS CodeBuild: " + project_name + ", Build Log (Click here)",
+            "title_link": CODEBUILD_URL.format(region, project_name, build_id),
+            "fields": fields,
+            "footer": "send by ecs-codepipeline-notifier",
+            "ts": now_unix_time,
+        }
+    ]
+
+    post_to_slack("", attachments)
+
+
+def parse_ecs_details(region, detail):
+    service_name = detail["group"].split(":")[-1]
+    cluster_name = detail["clusterArn"].split("/")[-1]
+    last_status = detail["lastStatus"]
+
+    # Omit below case
+    if last_status in ["DEPROVISIONING", "DEACTIVATING", "ACTIVATING", "PROVISIONING"]:
         return
 
-    buildInfo = BuildInfo(pid, cbi.pipeline)
+    desired_status = detail["desiredStatus"]
+    task_difinition = detail["taskDefinitionArn"].split("/")[-1]
 
-    existing_msg = find_message_for_build(buildInfo)
-    builder = MessageBuilder(buildInfo, existing_msg)
+    fields = [
+        {"title": "Last Status", "value": last_status, "short": "true"},
+        {"title": "Desired Status", "value": desired_status, "short": "true"},
+        {"title": "ECS Task Definition", "value": task_difinition},
+    ]
 
-    if "phases" in event["detail"]["additional-information"]:
-        phases = event["detail"]["additional-information"]["phases"]
-        builder.update_build_stage_info(stage, phases, actionStates)
+    color = ECS_RUN
+    if desired_status == "STOPPED":
+        color = ECS_STOP
 
-    logs = event["detail"].get("additional-information", {}).get("logs")
-    if logs:
-        builder.attach_logs(event["detail"]["additional-information"]["logs"])
+    now_unix_time = datetime.now().strftime("%s")
 
-    post_build_msg(builder)
+    attachments = [
+        {
+            "fallback": "ECS notification attachment",
+            "color": color,
+            "title": "Amazon ECS: " + cluster_name + "/" + service_name,
+            "title_link": ECS_URL.format(region, cluster_name, service_name),
+            "fields": fields,
+            "footer": "send by ecs-codepipeline-notifier",
+            "ts": now_unix_time,
+        }
+    ]
 
-
-def process(event):
-    if event["source"] == "aws.codepipeline":
-        process_code_pipeline(event)
-    if event["source"] == "aws.codebuild":
-        process_code_build(event)
-
-
-def run(event, context):
-    m = process(event)
-
-
-if __name__ == "__main__":
-    with open("test-event.json") as f:
-        events = json.load(f)
-        for e in events:
-            run(e, {})
-            time.sleep(1)
+    post_to_slack("", attachments)
